@@ -21,7 +21,6 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
-import java.util.Optional;
 
 import javax.servlet.Servlet;
 
@@ -107,6 +106,7 @@ import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurationSupport;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 import org.springframework.web.servlet.handler.AbstractHandlerExceptionResolver;
+import org.springframework.web.servlet.handler.AbstractUrlHandlerMapping;
 import org.springframework.web.servlet.i18n.AcceptHeaderLocaleResolver;
 import org.springframework.web.servlet.i18n.FixedLocaleResolver;
 import org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver;
@@ -426,17 +426,34 @@ public class WebMvcAutoConfiguration {
 		@Bean
 		public WelcomePageHandlerMapping welcomePageHandlerMapping(ApplicationContext applicationContext,
 				FormattingConversionService mvcConversionService, ResourceUrlProvider mvcResourceUrlProvider) {
-			WelcomePageHandlerMapping welcomePageHandlerMapping = new WelcomePageHandlerMapping(
-					new TemplateAvailabilityProviders(applicationContext), applicationContext, getWelcomePage(),
-					this.mvcProperties.getStaticPathPattern());
-			welcomePageHandlerMapping.setInterceptors(getInterceptors(mvcConversionService, mvcResourceUrlProvider));
-			welcomePageHandlerMapping.setCorsConfigurations(getCorsConfigurations());
-			return welcomePageHandlerMapping;
+			return createWelcomePageHandlerMapping(applicationContext, mvcConversionService, mvcResourceUrlProvider,
+					WelcomePageHandlerMapping::new);
 		}
 
-		private Optional<Resource> getWelcomePage() {
+		@Bean
+		public WelcomePageNotAcceptableHandlerMapping welcomePageNotAcceptableHandlerMapping(
+				ApplicationContext applicationContext, FormattingConversionService mvcConversionService,
+				ResourceUrlProvider mvcResourceUrlProvider) {
+			return createWelcomePageHandlerMapping(applicationContext, mvcConversionService, mvcResourceUrlProvider,
+					WelcomePageNotAcceptableHandlerMapping::new);
+		}
+
+		private <T extends AbstractUrlHandlerMapping> T createWelcomePageHandlerMapping(
+				ApplicationContext applicationContext, FormattingConversionService mvcConversionService,
+				ResourceUrlProvider mvcResourceUrlProvider, WelcomePageHandlerMappingFactory<T> factory) {
+			TemplateAvailabilityProviders templateAvailabilityProviders = new TemplateAvailabilityProviders(
+					applicationContext);
+			String staticPathPattern = this.mvcProperties.getStaticPathPattern();
+			T handlerMapping = factory.create(templateAvailabilityProviders, applicationContext, getWelcomePage(),
+					staticPathPattern);
+			handlerMapping.setInterceptors(getInterceptors(mvcConversionService, mvcResourceUrlProvider));
+			handlerMapping.setCorsConfigurations(getCorsConfigurations());
+			return handlerMapping;
+		}
+
+		private Resource getWelcomePage() {
 			String[] locations = getResourceLocations(this.resourceProperties.getStaticLocations());
-			return Arrays.stream(locations).map(this::getIndexHtml).filter(this::isReadable).findFirst();
+			return Arrays.stream(locations).map(this::getIndexHtml).filter(this::isReadable).findFirst().orElse(null);
 		}
 
 		private Resource getIndexHtml(String location) {
@@ -550,6 +567,15 @@ public class WebMvcAutoConfiguration {
 
 	}
 
+	@FunctionalInterface
+	interface WelcomePageHandlerMappingFactory<T extends AbstractUrlHandlerMapping> {
+
+		T create(TemplateAvailabilityProviders templateAvailabilityProviders, ApplicationContext applicationContext,
+				Resource indexHtmlResource, String staticPathPattern);
+
+	}
+
+	@FunctionalInterface
 	interface ResourceHandlerRegistrationCustomizer {
 
 		void customize(ResourceHandlerRegistration registration);
