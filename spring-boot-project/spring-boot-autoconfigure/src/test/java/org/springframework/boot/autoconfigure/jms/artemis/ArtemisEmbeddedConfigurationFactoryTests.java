@@ -16,8 +16,16 @@
 
 package org.springframework.boot.autoconfigure.jms.artemis;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.activemq.artemis.api.core.SimpleString;
 import org.apache.activemq.artemis.core.config.Configuration;
@@ -25,8 +33,14 @@ import org.apache.activemq.artemis.core.config.CoreAddressConfiguration;
 import org.apache.activemq.artemis.core.server.JournalType;
 import org.apache.activemq.artemis.core.settings.impl.AddressSettings;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.io.TempDir;
+
+import org.springframework.boot.system.ApplicationTemp;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 
 /**
  * Tests for {@link ArtemisEmbeddedConfigurationFactory}
@@ -44,6 +58,122 @@ class ArtemisEmbeddedConfigurationFactoryTests {
 		Configuration configuration = new ArtemisEmbeddedConfigurationFactory(properties).createConfiguration();
 		assertThat(configuration.getJournalDirectory()).startsWith(System.getProperty("java.io.tmpdir"))
 				.endsWith("/journal");
+	}
+
+	@Test
+	void defaultDataDirIsApplicationSpecific() {
+		ArtemisProperties properties = new ArtemisProperties();
+		properties.getEmbedded().setPersistent(true);
+		Configuration configuration = new ArtemisEmbeddedConfigurationFactory(properties).createConfiguration();
+		String dataDir = new ApplicationTemp().getDir("artemis-data").getAbsolutePath();
+		String sharedDataDir = new File(System.getProperty("java.io.tmpdir"), "artemis-data").getAbsolutePath();
+		assertThat(configuration.getJournalDirectory()).startsWith(dataDir).doesNotStartWith(sharedDataDir);
+	}
+
+	@Test
+	void defaultDataDirDoesNotUsePreCreatedSharedTempLocation(@TempDir Path temp) throws IOException {
+		Path tempDirectory = Files.createDirectory(temp.resolve("tmp"));
+		Path sharedDataDir = Files.createDirectory(tempDirectory.resolve("artemis-data"));
+		Files.createDirectory(sharedDataDir.resolve("journal"));
+		String previousTempDirectory = System.getProperty("java.io.tmpdir");
+		System.setProperty("java.io.tmpdir", tempDirectory.toString());
+		try {
+			ArtemisProperties properties = new ArtemisProperties();
+			properties.getEmbedded().setPersistent(true);
+			Configuration configuration = new ArtemisEmbeddedConfigurationFactory(properties).createConfiguration();
+			String dataDir = new ApplicationTemp().getDir("artemis-data").getAbsolutePath();
+			assertThat(dataDir).startsWith(tempDirectory.toString()).isNotEqualTo(sharedDataDir.toString());
+			assertThat(configuration.getJournalDirectory()).startsWith(dataDir)
+					.doesNotStartWith(sharedDataDir.toString());
+			assertThat(configuration.getBindingsDirectory()).startsWith(dataDir)
+					.doesNotStartWith(sharedDataDir.toString());
+			assertThat(configuration.getPagingDirectory()).startsWith(dataDir)
+					.doesNotStartWith(sharedDataDir.toString());
+			assertThat(configuration.getLargeMessagesDirectory()).startsWith(dataDir)
+					.doesNotStartWith(sharedDataDir.toString());
+		}
+		finally {
+			System.setProperty("java.io.tmpdir", previousTempDirectory);
+		}
+	}
+
+	@Test
+	@DisabledOnOs(OS.WINDOWS)
+	void defaultDataDirIsOnlyAccessibleByOwner(@TempDir Path temp) throws IOException {
+		Path tempDirectory = Files.createDirectory(temp.resolve("tmp"));
+		String previousTempDirectory = System.getProperty("java.io.tmpdir");
+		System.setProperty("java.io.tmpdir", tempDirectory.toString());
+		try {
+			Path dataDir = createConfigurationAndGetDataDir();
+			assertThat(dataDir).isDirectory();
+			assertThat(dataDir.getParent()).isEqualTo(new ApplicationTemp().getDir().toPath());
+			assertOwnerOnlyPermissions(dataDir);
+			assertOwnerOnlyPermissions(dataDir.getParent());
+		}
+		finally {
+			System.setProperty("java.io.tmpdir", previousTempDirectory);
+		}
+	}
+
+	@Test
+	@DisabledOnOs(OS.WINDOWS)
+	void defaultDataDirPermissionsAreRestrictedWhenItAlreadyExists(@TempDir Path temp) throws IOException {
+		Path tempDirectory = Files.createDirectory(temp.resolve("tmp"));
+		String previousTempDirectory = System.getProperty("java.io.tmpdir");
+		System.setProperty("java.io.tmpdir", tempDirectory.toString());
+		try {
+			Path applicationTempDirectory = new ApplicationTemp().getDir().toPath();
+			Path existingDataDir = Files.createDirectory(applicationTempDirectory.resolve("artemis-data"));
+			Set<PosixFilePermission> permissive = PosixFilePermissions.fromString("rwxrwxrwx");
+			Files.setPosixFilePermissions(applicationTempDirectory, permissive);
+			Files.setPosixFilePermissions(existingDataDir, permissive);
+			Path dataDir = createConfigurationAndGetDataDir();
+			assertThat(dataDir).isEqualTo(existingDataDir);
+			assertOwnerOnlyPermissions(dataDir);
+			assertOwnerOnlyPermissions(applicationTempDirectory);
+		}
+		finally {
+			System.setProperty("java.io.tmpdir", previousTempDirectory);
+		}
+	}
+
+	@Test
+	@DisabledOnOs(OS.WINDOWS)
+	void defaultDataDirWhenDataDirIsSymbolicLinkThrows(@TempDir Path temp) throws IOException {
+		Path tempDirectory = Files.createDirectory(temp.resolve("tmp"));
+		Path attackerDirectory = Files.createDirectory(temp.resolve("attacker"));
+		String previousTempDirectory = System.getProperty("java.io.tmpdir");
+		System.setProperty("java.io.tmpdir", tempDirectory.toString());
+		try {
+			Path applicationTempDirectory = new ApplicationTemp().getDir().toPath();
+			Files.createSymbolicLink(applicationTempDirectory.resolve("artemis-data"), attackerDirectory);
+			assertThatIllegalStateException().isThrownBy(this::createConfigurationAndGetDataDir)
+					.withMessageContaining("symbolic link");
+			assertThat(attackerDirectory.toFile().list()).isEmpty();
+		}
+		finally {
+			System.setProperty("java.io.tmpdir", previousTempDirectory);
+		}
+	}
+
+	@Test
+	@DisabledOnOs(OS.WINDOWS)
+	void defaultDataDirWhenApplicationTempIsSymbolicLinkThrows(@TempDir Path temp) throws IOException {
+		Path tempDirectory = Files.createDirectory(temp.resolve("tmp"));
+		Path attackerDirectory = Files.createDirectory(temp.resolve("attacker"));
+		String previousTempDirectory = System.getProperty("java.io.tmpdir");
+		System.setProperty("java.io.tmpdir", tempDirectory.toString());
+		try {
+			Path applicationTempDirectory = new ApplicationTemp().getDir().toPath();
+			Files.delete(applicationTempDirectory);
+			Files.createSymbolicLink(applicationTempDirectory, attackerDirectory);
+			assertThatIllegalStateException().isThrownBy(this::createConfigurationAndGetDataDir)
+					.withMessageContaining("symbolic link");
+			assertThat(attackerDirectory.toFile().list()).isEmpty();
+		}
+		finally {
+			System.setProperty("java.io.tmpdir", previousTempDirectory);
+		}
 	}
 
 	@Test
@@ -87,6 +217,19 @@ class ArtemisEmbeddedConfigurationFactoryTests {
 		Configuration configuration = new ArtemisEmbeddedConfigurationFactory(properties).createConfiguration();
 		List<CoreAddressConfiguration> addressConfigurations = configuration.getAddressConfigurations();
 		assertThat(addressConfigurations).hasSize(2);
+	}
+
+	private Path createConfigurationAndGetDataDir() {
+		ArtemisProperties properties = new ArtemisProperties();
+		properties.getEmbedded().setPersistent(true);
+		Configuration configuration = new ArtemisEmbeddedConfigurationFactory(properties).createConfiguration();
+		return Paths.get(configuration.getJournalDirectory()).getParent();
+	}
+
+	private void assertOwnerOnlyPermissions(Path path) throws IOException {
+		Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(path);
+		assertThat(permissions).containsExactlyInAnyOrder(PosixFilePermission.OWNER_READ,
+				PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE);
 	}
 
 }
