@@ -1,0 +1,96 @@
+name: "Seal Build spring-boot-autoconfigure"
+# Upstream builds on Concourse (ci/scripts/build-project.sh: ./gradlew build
+# publishAllPublicationsToDeploymentRepository); it ships no GitHub Actions
+# workflow that builds or tests. This workflow mirrors that build, scoped to
+# the spring-boot-autoconfigure module.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test selector, e.g. :spring-boot-project:spring-boot-autoconfigure:test --tests FooTests"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: "Build and test spring-boot-autoconfigure (Java 8)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      CI: "true"
+      # Testcontainers 1.15.0 cannot start Ryuk 0.3.0 / run its alpine startup
+      # checks against the runner's current Docker engine; without these every
+      # @Testcontainers(disabledWithoutDocker = true) class silently skips.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+      TESTCONTAINERS_CHECKS_DISABLE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+      - name: Route around repo.spring.io (now requires authentication)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # plugins-release is unreachable; the conventions plugin only lives there
+          perl -0pi -e "s/\s*maven \{\s*url 'https:\/\/repo\.spring\.io\/plugins-release'\s*\}//" settings.gradle
+          perl -0pi -e 's/\s*id "io\.spring\.gradle-enterprise-conventions" version "0\.0\.3"//' settings.gradle
+          # grolifant (via asciidoctor-gradle-jvm) is not on Central / plugin portal
+          perl -0pi -e 's|maven \{ url "https://repo\.spring\.io/release" \}|maven { url "https://repo.gradle.org/gradle/libs-releases"; content { includeGroup "org.ysb33r.gradle" } }|' buildSrc/build.gradle
+          git diff --stat
+      - name: Install test-result reporter
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/seal-test-results.gradle" <<'EOF'
+          allprojects { p ->
+              tasks.withType(Test).configureEach { t ->
+                  t.outputs.upToDateWhen { false }
+                  t.outputs.cacheIf { false }
+                  t.filter.failOnNoMatchingTests = false
+                  t.afterTest { desc, result ->
+                      if (result.resultType == TestResult.ResultType.FAILURE) {
+                          println "FAILED TEST: ${desc.className}#${desc.name} (${t.path})"
+                      } else if (result.resultType == TestResult.ResultType.SKIPPED) {
+                          def reason = result.exception?.message
+                          if (!reason) {
+                              // JUnit 5 @Disabled carries no exception; resolve the annotation from source
+                              def src = p.file("src/test/java/" + (desc.className ?: '').replace('.', '/') + ".java")
+                              if (src.exists()) {
+                                  def lines = src.readLines()
+                                  def method = (desc.name ?: '').replaceAll(/\(.*$/, '')
+                                  def idx = lines.findIndexOf { it =~ /void\s+${java.util.regex.Pattern.quote(method)}\s*\(/ }
+                                  if (idx > 0) {
+                                      for (int i = idx - 1; i >= 0 && i >= idx - 6; i--) {
+                                          if (lines[i].contains('@Disabled')) { reason = "source annotation " + lines[i].trim() + " at " + src.name + ":" + (i + 1); break }
+                                      }
+                                  }
+                              }
+                          }
+                          println "SKIPPED TEST: ${desc.className}#${desc.name} (${t.path}) -- reason: ${reason ?: 'disabled or assumption not met'}"
+                      }
+                  }
+                  t.afterSuite { desc, result ->
+                      if (desc.parent == null) {
+                          println "TEST SUMMARY ${t.path}: Tests: ${result.testCount}, passed: ${result.successfulTestCount}, failed: ${result.failedTestCount}, skipped: ${result.skippedTestCount}, result: ${result.resultType}"
+                      }
+                  }
+              }
+          }
+          EOF
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --console=plain -I "$RUNNER_TEMP/seal-test-results.gradle" :spring-boot-project:spring-boot-autoconfigure:assemble ${{ inputs.test-filter }}
+          else
+            ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --console=plain -I "$RUNNER_TEMP/seal-test-results.gradle" :spring-boot-project:spring-boot-autoconfigure:build
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-autoconfigure
+          path: spring-boot-project/spring-boot-autoconfigure/build/libs/spring-boot-autoconfigure-2.3.6.RELEASE.jar
+          if-no-files-found: error
