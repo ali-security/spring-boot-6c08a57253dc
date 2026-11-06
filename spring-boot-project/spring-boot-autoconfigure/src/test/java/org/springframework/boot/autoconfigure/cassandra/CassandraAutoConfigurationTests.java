@@ -16,22 +16,41 @@
 
 package org.springframework.boot.autoconfigure.cassandra;
 
+import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.security.KeyStore;
+import java.util.concurrent.atomic.AtomicReference;
+
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult.HandshakeStatus;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.TrustManagerFactory;
+
 import com.datastax.oss.driver.api.core.CqlIdentifier;
 import com.datastax.oss.driver.api.core.CqlSessionBuilder;
 import com.datastax.oss.driver.api.core.config.DefaultDriverOption;
 import com.datastax.oss.driver.api.core.config.DriverConfigLoader;
 import com.datastax.oss.driver.api.core.config.DriverExecutionProfile;
+import com.datastax.oss.driver.api.core.ssl.SslEngineFactory;
+import com.datastax.oss.driver.internal.core.metadata.DefaultEndPoint;
 import com.datastax.oss.driver.internal.core.session.throttling.ConcurrencyLimitingRequestThrottler;
 import com.datastax.oss.driver.internal.core.session.throttling.PassThroughRequestThrottler;
 import com.datastax.oss.driver.internal.core.session.throttling.RateLimitingRequestThrottler;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for {@link CassandraAutoConfiguration}
@@ -53,6 +72,74 @@ class CassandraAutoConfigurationTests {
 			CqlSessionBuilder secondBuilder = context.getBean(CqlSessionBuilder.class);
 			assertThat(secondBuilder).hasFieldOrPropertyWithValue("keyspace", null);
 		});
+	}
+
+	@Test
+	void cqlSessionBuilderWithSslEnabled() {
+		this.contextRunner.withPropertyValues("spring.data.cassandra.ssl=true").run((context) -> {
+			CqlSessionBuilder builder = context.getBean(CqlSessionBuilder.class);
+			assertThat(builder).hasFieldOrPropertyWithValue("sslConfigured", true);
+			assertThat(builder).extracting("programmaticArgumentsBuilder.sslEngineFactory")
+					.hasFieldOrPropertyWithValue("requireHostnameValidation", true);
+			SSLEngine engine = createClientSslEngine(getSslEngineFactory(context), "cassandra.example.com");
+			assertThat(engine.getUseClientMode()).isTrue();
+			assertThat(engine.getPeerHost()).isEqualTo("cassandra.example.com");
+			assertThat(engine.getPeerPort()).isEqualTo(9042);
+			assertThat(engine.getSSLParameters().getEndpointIdentificationAlgorithm()).isEqualTo("HTTPS");
+		});
+	}
+
+	@Test
+	void cqlSessionBuilderWithSslEnabledAndVerifyHostnameDisabled() {
+		this.contextRunner
+				.withPropertyValues("spring.data.cassandra.ssl=true", "spring.data.cassandra.ssl-verify-hostname=false")
+				.run((context) -> {
+					CqlSessionBuilder builder = context.getBean(CqlSessionBuilder.class);
+					assertThat(builder).hasFieldOrPropertyWithValue("sslConfigured", true);
+					assertThat(builder).extracting("programmaticArgumentsBuilder.sslEngineFactory")
+							.hasFieldOrPropertyWithValue("requireHostnameValidation", false);
+					SSLEngine engine = createClientSslEngine(getSslEngineFactory(context), "cassandra.example.com");
+					assertThat(engine.getUseClientMode()).isTrue();
+					assertThat(engine.getPeerHost()).isEqualTo("cassandra.example.com");
+					assertThat(engine.getSSLParameters().getEndpointIdentificationAlgorithm()).isNull();
+				});
+	}
+
+	@Test
+	void cqlSessionBuilderWithoutSsl() {
+		this.contextRunner.run((context) -> {
+			CqlSessionBuilder builder = context.getBean(CqlSessionBuilder.class);
+			assertThat(builder).hasFieldOrPropertyWithValue("sslConfigured", false);
+			assertThat(getSslEngineFactory(context)).isNull();
+		});
+	}
+
+	@Test
+	void sslHandshakeWithTrustedCertificateIssuedForAnotherHostIsRejected() throws Exception {
+		SSLContext sslContext = createTestSslContext();
+		SslEngineFactory factory = getSslEngineFactory(sslContext);
+		SSLEngine client = createClientSslEngine(factory, "cassandra.example.com");
+		SSLEngine server = createServerSslEngine(sslContext);
+		assertThatThrownBy(() -> handshake(client, server)).isInstanceOf(SSLException.class)
+				.hasStackTraceContaining("No subject alternative DNS name matching cassandra.example.com");
+	}
+
+	@Test
+	void sslHandshakeWithTrustedCertificateIssuedForSameHostIsAccepted() throws Exception {
+		SSLContext sslContext = createTestSslContext();
+		SslEngineFactory factory = getSslEngineFactory(sslContext);
+		SSLEngine client = createClientSslEngine(factory, "localhost");
+		handshake(client, createServerSslEngine(sslContext));
+		assertThat(client.getSession().getPeerCertificates()).hasSize(1);
+	}
+
+	@Test
+	void sslHandshakeWithCertificateForAnotherHostIsAcceptedWhenHostnameVerificationIsDisabled() throws Exception {
+		SSLContext sslContext = createTestSslContext();
+		SslEngineFactory factory = getSslEngineFactory(sslContext, "spring.data.cassandra.ssl-verify-hostname=false");
+		SSLEngine client = createClientSslEngine(factory, "cassandra.example.com");
+		handshake(client, createServerSslEngine(sslContext));
+		assertThat(client.getSession().getPeerCertificates()).hasSize(1);
 	}
 
 	@Test
@@ -206,6 +293,94 @@ class CassandraAutoConfigurationTests {
 					assertThat(config.getInt(DefaultDriverOption.REQUEST_THROTTLER_MAX_QUEUE_SIZE)).isEqualTo(72);
 					assertThat(config.getInt(DefaultDriverOption.REQUEST_THROTTLER_DRAIN_INTERVAL)).isEqualTo(16);
 				});
+	}
+
+	private SslEngineFactory getSslEngineFactory(AssertableApplicationContext context) {
+		CqlSessionBuilder builder = context.getBean(CqlSessionBuilder.class);
+		Object programmaticArguments = ReflectionTestUtils.getField(builder, "programmaticArgumentsBuilder");
+		return (SslEngineFactory) ReflectionTestUtils.getField(programmaticArguments, "sslEngineFactory");
+	}
+
+	private SslEngineFactory getSslEngineFactory(SSLContext sslContext, String... properties) throws Exception {
+		SSLContext defaultSslContext = SSLContext.getDefault();
+		SSLContext.setDefault(sslContext);
+		try {
+			AtomicReference<SslEngineFactory> sslEngineFactory = new AtomicReference<>();
+			ApplicationContextRunner runner = this.contextRunner.withPropertyValues("spring.data.cassandra.ssl=true");
+			runner = runner.withPropertyValues(properties);
+			runner.run((context) -> sslEngineFactory.set(getSslEngineFactory(context)));
+			assertThat(sslEngineFactory.get()).isNotNull();
+			return sslEngineFactory.get();
+		}
+		finally {
+			SSLContext.setDefault(defaultSslContext);
+		}
+	}
+
+	private SSLEngine createClientSslEngine(SslEngineFactory sslEngineFactory, String host) {
+		return sslEngineFactory.newSslEngine(new DefaultEndPoint(InetSocketAddress.createUnresolved(host, 9042)));
+	}
+
+	private SSLContext createTestSslContext() throws Exception {
+		KeyStore keyStore = KeyStore.getInstance("JKS");
+		try (InputStream inputStream = new ClassPathResource("test.jks", getClass()).getInputStream()) {
+			keyStore.load(inputStream, "secret".toCharArray());
+		}
+		KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+		keyManagerFactory.init(keyStore, "secret".toCharArray());
+		String trustAlgorithm = TrustManagerFactory.getDefaultAlgorithm();
+		TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(trustAlgorithm);
+		trustManagerFactory.init(keyStore);
+		SSLContext sslContext = SSLContext.getInstance("TLS");
+		sslContext.init(keyManagerFactory.getKeyManagers(), trustManagerFactory.getTrustManagers(), null);
+		return sslContext;
+	}
+
+	private SSLEngine createServerSslEngine(SSLContext sslContext) {
+		SSLEngine engine = sslContext.createSSLEngine();
+		engine.setUseClientMode(false);
+		return engine;
+	}
+
+	private void handshake(SSLEngine client, SSLEngine server) throws SSLException {
+		ByteBuffer empty = ByteBuffer.allocate(0);
+		ByteBuffer clientToServer = ByteBuffer.allocate(client.getSession().getPacketBufferSize());
+		ByteBuffer serverToClient = ByteBuffer.allocate(server.getSession().getPacketBufferSize());
+		ByteBuffer clientApplicationData = ByteBuffer.allocate(client.getSession().getApplicationBufferSize());
+		ByteBuffer serverApplicationData = ByteBuffer.allocate(server.getSession().getApplicationBufferSize());
+		client.beginHandshake();
+		server.beginHandshake();
+		for (int i = 0; i < 1000; i++) {
+			if (isHandshakeComplete(client) && isHandshakeComplete(server)) {
+				return;
+			}
+			client.wrap(empty, clientToServer);
+			runDelegatedTasks(client);
+			server.wrap(empty, serverToClient);
+			runDelegatedTasks(server);
+			clientToServer.flip();
+			serverToClient.flip();
+			client.unwrap(serverToClient, clientApplicationData);
+			runDelegatedTasks(client);
+			server.unwrap(clientToServer, serverApplicationData);
+			runDelegatedTasks(server);
+			clientToServer.compact();
+			serverToClient.compact();
+		}
+		throw new IllegalStateException("SSL handshake did not complete");
+	}
+
+	private boolean isHandshakeComplete(SSLEngine engine) {
+		HandshakeStatus status = engine.getHandshakeStatus();
+		return status == HandshakeStatus.NOT_HANDSHAKING || status == HandshakeStatus.FINISHED;
+	}
+
+	private void runDelegatedTasks(SSLEngine engine) {
+		Runnable task = engine.getDelegatedTask();
+		while (task != null) {
+			task.run();
+			task = engine.getDelegatedTask();
+		}
 	}
 
 	@Configuration(proxyBeanMethods = false)
